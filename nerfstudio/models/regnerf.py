@@ -17,7 +17,8 @@ Implementation of RegNeRF.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple
 
 import torch
 from torch.nn import Parameter
@@ -26,6 +27,7 @@ from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from nerfstudio.cameras.rays import RayBundle
+from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
@@ -41,6 +43,18 @@ from nerfstudio.models.vanilla_nerf import VanillaModelConfig
 from nerfstudio.utils import colormaps, colors, misc
 
 
+@dataclass
+class RegNerfModelConfig(VanillaModelConfig):
+    """RegNerf config"""
+
+    loss_coefficients: Dict[str, float] = to_immutable_dict({
+        "rgb_loss_coarse": 1.0,
+        "rgb_loss_fine": 1.0,
+        "depth_smoothness": 1.0,
+        "color_likelihood": 1.0,
+    })
+
+
 class RegNerfModel(Model):
     """RegNeRF model
 
@@ -48,11 +62,11 @@ class RegNerfModel(Model):
         config: RegNerf configuration to instantiate model
     """
 
-    config: VanillaModelConfig
+    config: RegNerfModelConfig
 
     def __init__(
         self,
-        config: VanillaModelConfig,
+        config: RegNerfModelConfig,
         **kwargs,
     ) -> None:
         self.field = None
@@ -101,14 +115,13 @@ class RegNerfModel(Model):
         return param_groups
 
     def get_outputs(self, ray_bundle: RayBundle):
-        print("Regnerf get outputs")
         if self.field is None:
             raise ValueError("populate_fields() must be called before get_outputs")
 
         # uniform sampling
         ray_samples_uniform = self.sampler_uniform(ray_bundle)
 
-        # First pass:
+        # First pass: coarse network
         field_outputs_coarse = self.field.forward(ray_samples_uniform)
         weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
         rgb_coarse = self.renderer_rgb(
@@ -121,7 +134,7 @@ class RegNerfModel(Model):
         # pdf sampling
         ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse)
 
-        # Second pass:
+        # Second pass: fine network
         field_outputs_fine = self.field.forward(ray_samples_pdf)
         weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
         rgb_fine = self.renderer_rgb(

@@ -62,7 +62,7 @@ from nerfstudio.models.nerfplayer_nerfacto import NerfplayerNerfactoModelConfig
 from nerfstudio.models.nerfplayer_ngp import NerfplayerNGPModelConfig
 from nerfstudio.models.neus import NeuSModelConfig
 from nerfstudio.models.neus_facto import NeuSFactoModelConfig
-from nerfstudio.models.regnerf import RegNerfModel
+from nerfstudio.models.regnerf import RegNerfModel, RegNerfModelConfig
 from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
@@ -601,9 +601,14 @@ method_configs["regnerf"] = TrainerConfig(
     method_name="regnerf",
     pipeline=VanillaPipelineConfig(
         datamanager=VanillaDataManagerConfig(dataparser=NerfstudioDataParserConfig(), train_num_rays_per_batch=1024),
-        model=VanillaModelConfig(
+        model=RegNerfModelConfig(
             _target=RegNerfModel,
-            loss_coefficients={"rgb_loss_coarse": 0.1, "rgb_loss_fine": 1.0},
+            loss_coefficients={
+                "rgb_loss_coarse": 0.1,
+                "rgb_loss_fine": 1.0,
+                "depth_smoothness": 1.0,
+                "color_likelihood": 1.0,
+            },
             num_coarse_samples=128,
             num_importance_samples=128,
             eval_num_rays_per_chunk=1024,
