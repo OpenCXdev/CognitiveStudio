@@ -18,6 +18,7 @@ Implementation of RegNeRF.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import sqrt
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -54,14 +55,17 @@ class RegNerfModelConfig(VanillaModelConfig):
         "color_likelihood": 1.0,
     })
     """Overrides corresponding param from ``ModelConfig``."""
+
     randpose_count: int = 10000
     """Size of random pose set to use for regularization."""
     randpose_radius: float = 4.03112885717555
-    """Radius of sphere from which to sample random poses.
+    """Random poses are sampled from a sphere of this radius.
     TODO: The Jax implementation uses this particular value. Is there a reason for this?
     """
-    s_patch: int = 8
-    """Patch size for regularizing geometry smoothness and color likelihood."""
+    randpose_s_patch: int = 8
+    """Random pose patch size."""
+    randpose_focal: float = 1.0
+    """Random pose patch focal length."""
 
 
 class RegNerfModel(Model):
@@ -108,7 +112,7 @@ class RegNerfModel(Model):
         side = normalize(torch.cross(forward, up))
         up = normalize(torch.cross(side, forward))
         forward = -1 * forward
-        rotations = torch.stack([side, up, forward], dim=1)
+        rotations = torch.stack([side, up, forward], dim=-1)
 
         # Combine ``origins`` and ``rotations`` to SE(3) poses.
         # Actually, we use a 3x4 matrix. The last row doesn't matter.
@@ -116,12 +120,65 @@ class RegNerfModel(Model):
 
         return poses
 
+    def generate_patch_rays(self, poses) -> RayBundle:
+        """
+        For each pose, generate a square patch of rays.
+        Patch size is config.randpose_s_patch
+        Focal length is config.focal_length
+        Return:
+            RayBundle where origins and directions are the same shape.
+            directions[n][i][j] gives ray dir for
+                - random pose n,
+                - pixel (i, j) in the patch.
+            Same for origins
+        """
+        s_patch = self.config.randpose_s_patch
+        focal = self.config.randpose_focal
+
+        x, y = torch.meshgrid(
+            torch.linspace(-1, 1, s_patch),
+            torch.linspace(-1, 1, s_patch),
+            indexing="xy",
+        )
+        # Shape (s_patch, s_patch, 3)
+        # Camera faces in -Z direction. We will rotate these rays in the next step.
+        # ray_dirs[i, j] gives ray direction for pixel (i, j) for the -Z camera.
+        ray_dirs = torch.stack([x, y, -torch.ones_like(x)], dim=-1)
+        # Now for each pose, apply the pose's rotation to ray_dirs
+        # This creates a unique set of rays for each pose.
+        # Shape (randpose_count, s_patch, s_patch, 3)
+        # This line is matrix multiplication on last two dims; the operator @ doesn't work.
+        pose_ray_dirs = torch.sum(poses[:, None, None, :, :3] * ray_dirs[None, ..., None, :], dim=-1)
+        # origins is same shape as pose_ray_dirs.
+        origins = torch.empty_like(pose_ray_dirs)
+        origins[:] = poses[:, None, None, :, 3]
+
+        # Compute pixel area
+        # RMS of distance between pose_ray_dirs[i, j] and pose_ray_dirs[i, j+1]
+        dx = torch.sqrt(torch.sum(
+            (pose_ray_dirs[:, :-1] - pose_ray_dirs[:, 1:]) ** 2,
+            dim=-1,
+        ))
+        # Convert dim 1 back to original shape.
+        dx = torch.cat([dx, dx[:, -2:-1]], dim=1)
+        # This particular scaling comes from the paper.
+        pixel_area = dx[..., None] * 2 / sqrt(12)
+
+        # Create RayBundle
+        rays = RayBundle(
+            origins=origins,
+            directions=pose_ray_dirs,
+            pixel_area=pixel_area,
+        )
+        return rays
+
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
 
         # Set up random poses.
         self.random_poses = self.generate_random_poses()
+        self.random_rays = self.generate_patch_rays(self.random_poses)
 
         # setting up fields
         position_encoding = NeRFEncoding(
@@ -257,3 +314,27 @@ class RegNerfModel(Model):
         }
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict
+
+
+def plot_patch_rays(patch_rays: RayBundle):
+    """
+    3D matplotlib of a few patches.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import art3d
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    for i in range(3):
+        dirs = torch.flatten(patch_rays.directions[i], start_dim=0, end_dim=1)
+        origin = torch.flatten(patch_rays.origins[i], start_dim=0, end_dim=1)
+        for j in range(dirs.size(0)):
+            lc = art3d.Line3DCollection([[origin[j], origin[j]+dirs[j]]])
+            ax.add_collection(lc)
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+
+    plt.show()

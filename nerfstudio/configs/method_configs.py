@@ -620,6 +620,8 @@ method_configs["regnerf"] = TrainerConfig(
             "scheduler": None,
         }
     },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer+wandb",
 )
 
 
