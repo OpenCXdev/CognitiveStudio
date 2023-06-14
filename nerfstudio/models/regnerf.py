@@ -17,11 +17,13 @@ Implementation of RegNeRF.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from math import sqrt
 from typing import Any, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.functional import structural_similarity_index_measure
@@ -64,8 +66,10 @@ class RegNerfModelConfig(VanillaModelConfig):
     """
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 1.0
+    randpose_focal: float = 5
     """Random pose patch focal length."""
+    randpose_bs: int = 16
+    """Batch size (number of poses) per step for regularization."""
 
 
 class RegNerfModel(Model):
@@ -106,8 +110,8 @@ class RegNerfModel(Model):
         origins = normalize(origins) * self.config.randpose_radius
 
         # Create SO(3) rotation matrices. Look at (0, 0, 0) from each ``origin[i]``.
-        target = torch.tensor([0, 0, 0], dtype=torch.float32).unsqueeze(0)
-        up = torch.tensor([0, 0, 1], dtype=torch.float32).unsqueeze(0)
+        target = torch.tensor([[0, 0, 0]], dtype=torch.float32) + 0.125 * torch.randn((1, 3), dtype=torch.float32)
+        up = torch.tensor([[0, 0, 1]], dtype=torch.float32)
         forward = normalize(target - origins)
         side = normalize(torch.cross(forward, up))
         up = normalize(torch.cross(side, forward))
@@ -143,7 +147,8 @@ class RegNerfModel(Model):
         # Shape (s_patch, s_patch, 3)
         # Camera faces in -Z direction. We will rotate these rays in the next step.
         # ray_dirs[i, j] gives ray direction for pixel (i, j) for the -Z camera.
-        ray_dirs = torch.stack([x, y, -torch.ones_like(x)], dim=-1)
+        ray_dirs = torch.stack([x, y, -focal * torch.ones_like(x)], dim=-1)
+        ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=-1, keepdim=True)
         # Now for each pose, apply the pose's rotation to ray_dirs
         # This creates a unique set of rays for each pose.
         # Shape (randpose_count, s_patch, s_patch, 3)
@@ -165,12 +170,29 @@ class RegNerfModel(Model):
         pixel_area = dx[..., None] * 2 / sqrt(12)
 
         # Create RayBundle
+        origins = origins.reshape(origins.size(0), -1, 3)
+        pose_ray_dirs = pose_ray_dirs.reshape(pose_ray_dirs.size(0), -1, 3)
+        pixel_area = pixel_area.reshape(pixel_area.size(0), -1, 1)
         rays = RayBundle(
             origins=origins,
             directions=pose_ray_dirs,
             pixel_area=pixel_area,
-        )
+            nears=torch.ones_like(origins[..., :1]) * 0.05,
+            fars=torch.ones_like(origins[..., :1]) * 100,
+        ).to("cuda")
         return rays
+
+    def depth_smoothness_loss(self, depth: torch.Tensor) -> torch.Tensor:
+        """
+        Compute depth smoothness loss.
+
+        Args:
+            depth: Predicted depth map. Shape (h, w)
+        """
+        return (
+            F.mse_loss(depth[:-1], depth[1:]) +
+            F.mse_loss(depth[:, :-1], depth[:, 1:])
+        )
 
     def populate_modules(self):
         """Set the fields and modules"""
@@ -179,6 +201,7 @@ class RegNerfModel(Model):
         # Set up random poses.
         self.random_poses = self.generate_random_poses()
         self.random_rays = self.generate_patch_rays(self.random_poses)
+        #plot_patch_rays(self.random_rays)
 
         # setting up fields
         position_encoding = NeRFEncoding(
@@ -257,10 +280,27 @@ class RegNerfModel(Model):
         return outputs
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
+        # RGB loss between render and ground truth.
         image = batch["image"].to(self.device)
         rgb_loss_coarse = self.rgb_loss(image, outputs["rgb_coarse"])
         rgb_loss_fine = self.rgb_loss(image, outputs["rgb_fine"])
-        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+
+        # Depth smoothness loss.
+        # Choose a random batch of poses.
+        patches = random.choices(range(self.config.randpose_count), k=self.config.randpose_bs)
+        depth_loss = 0
+        for patch_i in patches:
+            patch_outputs = self.get_outputs(self.random_rays[patch_i])
+            # Compute loss on coarse and fine.
+            for depth in (patch_outputs["depth_coarse"], patch_outputs["depth_fine"]):
+                depth = depth.view(self.config.randpose_s_patch, self.config.randpose_s_patch)
+                depth_loss += self.depth_smoothness_loss(depth)
+
+        loss_dict = {
+            "rgb_loss_coarse": rgb_loss_coarse,
+            "rgb_loss_fine": rgb_loss_fine,
+            "depth_smoothness": depth_loss,
+        }
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 

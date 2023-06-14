@@ -310,6 +310,8 @@ method_configs["mipnerf"] = TrainerConfig(
             "scheduler": None,
         }
     },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 12),
+    vis="viewer+wandb",
 )
 
 method_configs["semantic-nerfw"] = TrainerConfig(
