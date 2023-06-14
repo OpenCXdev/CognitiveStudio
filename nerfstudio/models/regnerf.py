@@ -53,6 +53,15 @@ class RegNerfModelConfig(VanillaModelConfig):
         "depth_smoothness": 1.0,
         "color_likelihood": 1.0,
     })
+    """Overrides corresponding param from ``ModelConfig``."""
+    randpose_count: int = 10000
+    """Size of random pose set to use for regularization."""
+    randpose_radius: float = 4.03112885717555
+    """Radius of sphere from which to sample random poses.
+    TODO: The Jax implementation uses this particular value. Is there a reason for this?
+    """
+    s_patch: int = 8
+    """Patch size for regularizing geometry smoothness and color likelihood."""
 
 
 class RegNerfModel(Model):
@@ -70,13 +79,49 @@ class RegNerfModel(Model):
         **kwargs,
     ) -> None:
         self.field = None
-        assert config.collider_params is not None, "RegNeRF model requires bounding box collider parameters."
+        assert config.collider_params is not None, "RegNeRF requires bounding box collider parameters."
         super().__init__(config=config, **kwargs)
         assert self.config.collider_params is not None, "RegNeRF requires collider parameters to be set."
+
+    def generate_random_poses(self) -> torch.Tensor:
+        """
+        Generate random poses to do regularization from.
+        Returns:
+            Torch tensor of shape (randpose_count, 3, 4)
+            ret[i] gives SE(3) pose of camera i.
+        """
+        def normalize(x, eps=1e-8):
+            """
+            Normalizes ``x`` on last dimension.
+            """
+            return x / (torch.norm(x, dim=-1, keepdim=True) + eps)
+
+        # Sample from top hemisphere.
+        origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32)
+        origins[:, 2] = torch.abs(origins[:, 2])
+        origins = normalize(origins) * self.config.randpose_radius
+
+        # Create SO(3) rotation matrices. Look at (0, 0, 0) from each ``origin[i]``.
+        target = torch.tensor([0, 0, 0], dtype=torch.float32).unsqueeze(0)
+        up = torch.tensor([0, 0, 1], dtype=torch.float32).unsqueeze(0)
+        forward = normalize(target - origins)
+        side = normalize(torch.cross(forward, up))
+        up = normalize(torch.cross(side, forward))
+        forward = -1 * forward
+        rotations = torch.stack([side, up, forward], dim=1)
+
+        # Combine ``origins`` and ``rotations`` to SE(3) poses.
+        # Actually, we use a 3x4 matrix. The last row doesn't matter.
+        poses = torch.cat([rotations, origins.unsqueeze(-1)], dim=-1)
+
+        return poses
 
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
+
+        # Set up random poses.
+        self.random_poses = self.generate_random_poses()
 
         # setting up fields
         position_encoding = NeRFEncoding(
