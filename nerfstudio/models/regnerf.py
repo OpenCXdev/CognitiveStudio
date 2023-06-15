@@ -56,19 +56,19 @@ class RegNerfModelConfig(VanillaModelConfig):
         "depth_smoothness": 1.0,
         "color_likelihood": 1.0,
     })
-    """Overrides corresponding param from ``ModelConfig``."""
+    """Overrides corresponding param from ModelConfig."""
 
     randpose_count: int = 10000
-    """Size of random pose set to use for regularization."""
+    """Number of random poses to generate for regularization."""
     randpose_radius: float = 4.03112885717555
     """Random poses are sampled from a sphere of this radius.
     TODO: The Jax implementation uses this particular value. Is there a reason for this?
     """
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 5
+    randpose_focal: float = 8
     """Random pose patch focal length."""
-    randpose_bs: int = 16
+    randpose_bs: int = 4
     """Batch size (number of poses) per step for regularization."""
 
 
@@ -109,7 +109,7 @@ class RegNerfModel(Model):
         origins[:, 2] = torch.abs(origins[:, 2])
         origins = normalize(origins) * self.config.randpose_radius
 
-        # Create SO(3) rotation matrices. Look at (0, 0, 0) from each ``origin[i]``.
+        # Create SO(3) rotation matrices. Look at (0, 0, 0)+jitter from each ``origin[i]``.
         target = torch.tensor([[0, 0, 0]], dtype=torch.float32) + 0.125 * torch.randn((1, 3), dtype=torch.float32)
         up = torch.tensor([[0, 0, 1]], dtype=torch.float32)
         forward = normalize(target - origins)
@@ -119,7 +119,7 @@ class RegNerfModel(Model):
         rotations = torch.stack([side, up, forward], dim=-1)
 
         # Combine ``origins`` and ``rotations`` to SE(3) poses.
-        # Actually, we use a 3x4 matrix. The last row doesn't matter.
+        # We use a 3x4 matrix because the last row doesn't matter.
         poses = torch.cat([rotations, origins.unsqueeze(-1)], dim=-1)
 
         return poses
@@ -152,7 +152,7 @@ class RegNerfModel(Model):
         # Now for each pose, apply the pose's rotation to ray_dirs
         # This creates a unique set of rays for each pose.
         # Shape (randpose_count, s_patch, s_patch, 3)
-        # This line is matrix multiplication on last two dims; the operator @ doesn't work.
+        # This line is matrix mult on last two dims; the operator @ doesn't work.
         pose_ray_dirs = torch.sum(poses[:, None, None, :, :3] * ray_dirs[None, ..., None, :], dim=-1)
         # origins is same shape as pose_ray_dirs.
         origins = torch.empty_like(pose_ray_dirs)
@@ -164,7 +164,7 @@ class RegNerfModel(Model):
             (pose_ray_dirs[:, :-1] - pose_ray_dirs[:, 1:]) ** 2,
             dim=-1,
         ))
-        # Convert dim 1 back to original shape.
+        # Convert dim 1 back to original shape. In the previous step it was reduced by 1.
         dx = torch.cat([dx, dx[:, -2:-1]], dim=1)
         # This particular scaling comes from the paper.
         pixel_area = dx[..., None] * 2 / sqrt(12)
@@ -295,6 +295,7 @@ class RegNerfModel(Model):
             for depth in (patch_outputs["depth_coarse"], patch_outputs["depth_fine"]):
                 depth = depth.view(self.config.randpose_s_patch, self.config.randpose_s_patch)
                 depth_loss += self.depth_smoothness_loss(depth)
+        depth_loss /= len(patches) * 2
 
         loss_dict = {
             "rgb_loss_coarse": rgb_loss_coarse,
