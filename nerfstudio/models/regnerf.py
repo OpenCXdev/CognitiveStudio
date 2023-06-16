@@ -64,9 +64,11 @@ class RegNerfModelConfig(VanillaModelConfig):
     """Random poses are sampled from a sphere of this radius.
     TODO: The Jax implementation uses this particular value. Is there a reason for this?
     """
+    randpose_only_up: bool = False
+    """Whether to only sample random poses from upper hemisphere."""
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 8
+    randpose_focal: float = 2
     """Random pose patch focal length."""
     randpose_bs: int = 4
     """Batch size (number of poses) per step for regularization."""
@@ -106,7 +108,8 @@ class RegNerfModel(Model):
 
         # Sample from top hemisphere.
         origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32)
-        origins[:, 2] = torch.abs(origins[:, 2])
+        if self.config.randpose_only_up:
+            origins[:, 2] = torch.abs(origins[:, 2])
         origins = normalize(origins) * self.config.randpose_radius
 
         # Create SO(3) rotation matrices. Look at (0, 0, 0)+jitter from each ``origin[i]``.
@@ -131,9 +134,9 @@ class RegNerfModel(Model):
         Focal length is config.focal_length
         Return:
             RayBundle where origins and directions are the same shape.
-            directions[n][i][j] gives ray dir for
+            directions[n][index] gives ray dir for
                 - random pose n,
-                - pixel (i, j) in the patch.
+                - pixel index in that pose's patch.
             Same for origins
         """
         s_patch = self.config.randpose_s_patch
@@ -178,13 +181,13 @@ class RegNerfModel(Model):
             directions=pose_ray_dirs,
             pixel_area=pixel_area,
             nears=torch.ones_like(origins[..., :1]) * 0.05,
-            fars=torch.ones_like(origins[..., :1]) * 100,
+            fars=torch.ones_like(origins[..., :1]) * 10,
         ).to("cuda")
         return rays
 
     def depth_smoothness_loss(self, depth: torch.Tensor) -> torch.Tensor:
         """
-        Compute depth smoothness loss.
+        Compute depth smoothness loss on one patch.
 
         Args:
             depth: Predicted depth map. Shape (h, w)
@@ -296,6 +299,7 @@ class RegNerfModel(Model):
                 depth = depth.view(self.config.randpose_s_patch, self.config.randpose_s_patch)
                 depth_loss += self.depth_smoothness_loss(depth)
         depth_loss /= len(patches) * 2
+        print(depth_loss)
 
         loss_dict = {
             "rgb_loss_coarse": rgb_loss_coarse,
@@ -368,9 +372,9 @@ def plot_patch_rays(patch_rays: RayBundle):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
     for i in range(3):
-        dirs = torch.flatten(patch_rays.directions[i], start_dim=0, end_dim=1)
-        origin = torch.flatten(patch_rays.origins[i], start_dim=0, end_dim=1)
-        for j in range(dirs.size(0)):
+        dirs = patch_rays.directions[i].detach().cpu().numpy()
+        origin = patch_rays.origins[i].detach().cpu().numpy()
+        for j in range(dirs.shape[0]):
             lc = art3d.Line3DCollection([[origin[j], origin[j]+dirs[j]]])
             ax.add_collection(lc)
 
