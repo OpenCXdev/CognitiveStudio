@@ -58,6 +58,11 @@ class RegNerfModelConfig(VanillaModelConfig):
     })
     """Overrides corresponding param from ModelConfig."""
 
+    near_plane: float = 0.05
+    """How far along the ray to start sampling."""
+    far_plane: float = 10
+    """How far along the ray to stop sampling."""
+
     randpose_count: int = 10000
     """Number of random poses to generate for regularization."""
     randpose_radius: float = 4.03112885717555
@@ -134,9 +139,9 @@ class RegNerfModel(Model):
         Focal length is config.focal_length
         Return:
             RayBundle where origins and directions are the same shape.
-            directions[n][index] gives ray dir for
+            directions[n][i][j] gives ray dir for
                 - random pose n,
-                - pixel index in that pose's patch.
+                - pixel (i, j) in that pose's patch.
             Same for origins
         """
         s_patch = self.config.randpose_s_patch
@@ -173,15 +178,15 @@ class RegNerfModel(Model):
         pixel_area = dx[..., None] * 2 / sqrt(12)
 
         # Create RayBundle
-        origins = origins.reshape(origins.size(0), -1, 3)
-        pose_ray_dirs = pose_ray_dirs.reshape(pose_ray_dirs.size(0), -1, 3)
-        pixel_area = pixel_area.reshape(pixel_area.size(0), -1, 1)
+        #origins = origins.reshape(origins.size(0), -1, 3)
+        #pose_ray_dirs = pose_ray_dirs.reshape(pose_ray_dirs.size(0), -1, 3)
+        #pixel_area = pixel_area.reshape(pixel_area.size(0), -1, 1)
         rays = RayBundle(
             origins=origins,
             directions=pose_ray_dirs,
             pixel_area=pixel_area,
-            nears=torch.ones_like(origins[..., :1]) * 0.05,
-            fars=torch.ones_like(origins[..., :1]) * 10,
+            nears=torch.ones_like(origins[..., :1]) * self.config.near_plane,
+            fars=torch.ones_like(origins[..., :1]) * self.config.far_plane,
         ).to("cuda")
         return rays
 
@@ -190,12 +195,12 @@ class RegNerfModel(Model):
         Compute depth smoothness loss on one patch.
 
         Args:
-            depth: Predicted depth map. Shape (h, w)
+            depth: Predicted depth map. Shape (bs, h, w)
         """
-        return (
-            F.mse_loss(depth[:-1], depth[1:]) +
-            F.mse_loss(depth[:, :-1], depth[:, 1:])
-        )
+        v00 = depth[:, :-1, :-1]
+        v01 = depth[:, :-1, 1:]
+        v10 = depth[:, 1:, :-1]
+        return F.mse_loss(v00, v01) + F.mse_loss(v00, v10)
 
     def populate_modules(self):
         """Set the fields and modules"""
@@ -291,15 +296,21 @@ class RegNerfModel(Model):
         # Depth smoothness loss.
         # Choose a random batch of poses.
         patches = random.choices(range(self.config.randpose_count), k=self.config.randpose_bs)
+        # Forward pass
+        rays = RayBundle(
+            origins=self.random_rays.origins[patches].view(-1, 3),
+            directions=self.random_rays.directions[patches].view(-1, 3),
+            pixel_area=self.random_rays.pixel_area[patches].view(-1, 1),
+            nears=self.random_rays.nears[patches].view(-1, 1),
+            fars=self.random_rays.fars[patches].view(-1, 1),
+        )
+        patch_outputs = self.get_outputs(rays)
+        # Compute loss on coarse and fine.
         depth_loss = 0
-        for patch_i in patches:
-            patch_outputs = self.get_outputs(self.random_rays[patch_i])
-            # Compute loss on coarse and fine.
-            for depth in (patch_outputs["depth_coarse"], patch_outputs["depth_fine"]):
-                depth = depth.view(self.config.randpose_s_patch, self.config.randpose_s_patch)
-                depth_loss += self.depth_smoothness_loss(depth)
-        depth_loss /= len(patches) * 2
-        print(depth_loss)
+        for depth in (patch_outputs["depth_coarse"], patch_outputs["depth_fine"]):
+            depth = depth.view(len(patches), self.config.randpose_s_patch, self.config.randpose_s_patch)
+            depth_loss += self.depth_smoothness_loss(depth)
+        depth_loss /= 2
 
         loss_dict = {
             "rgb_loss_coarse": rgb_loss_coarse,
@@ -372,8 +383,8 @@ def plot_patch_rays(patch_rays: RayBundle):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
     for i in range(3):
-        dirs = patch_rays.directions[i].detach().cpu().numpy()
-        origin = patch_rays.origins[i].detach().cpu().numpy()
+        dirs = patch_rays.directions[i].view(-1, 3).detach().cpu().numpy()
+        origin = patch_rays.origins[i].view(-1, 3).detach().cpu().numpy()
         for j in range(dirs.shape[0]):
             lc = art3d.Line3DCollection([[origin[j], origin[j]+dirs[j]]])
             ax.add_collection(lc)
