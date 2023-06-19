@@ -33,6 +33,7 @@ The following methods are supported in nerfstudio:
     Mip-NeRF<mipnerf.md>
     NeRF<nerf.md>
     Nerfacto<nerfacto.md>
+    RegNeRF<regnerf.md>
     Tetra-NeRF<tetranerf.md>
     TensoRF<tensorf.md>
 ```
