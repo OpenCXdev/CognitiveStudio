@@ -34,7 +34,7 @@ from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
-from nerfstudio.model_components.losses import MSELoss
+from nerfstudio.model_components.losses import MSELoss, depth_loss
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
@@ -58,22 +58,19 @@ class RegNerfModelConfig(VanillaModelConfig):
     })
     """Overrides corresponding param from ModelConfig."""
 
-    near_plane: float = 0.05
-    """How far along the ray to start sampling."""
-    far_plane: float = 10
-    """How far along the ray to stop sampling."""
-
     randpose_count: int = 10000
     """Number of random poses to generate for regularization."""
-    randpose_radius: float = 3
-    """Random poses are sampled from a sphere of this radius."""
+    randpose_rad_min: float = 3
+    """Min radius of random poses."""
+    randpose_rad_max: float = 10
+    """Max radius of random poses."""
     randpose_only_up: bool = False
     """Whether to only sample random poses from upper hemisphere."""
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 16
+    randpose_focal: float = 8
     """Random pose patch focal length."""
-    randpose_bs: int = 8
+    randpose_bs: int = 16
     """Batch size (number of poses) per step for regularization."""
 
 
@@ -113,7 +110,11 @@ class RegNerfModel(Model):
         origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32, requires_grad=True)
         if self.config.randpose_only_up:
             origins[:, 2] = torch.abs(origins[:, 2])
-        origins = normalize(origins) * self.config.randpose_radius
+        rad_min = self.config.randpose_rad_min
+        rad_max = self.config.randpose_rad_max
+        radius = torch.rand((self.config.randpose_count, 1), dtype=torch.float32, requires_grad=True)
+        radius = rad_min + (rad_max - rad_min) * radius
+        origins = normalize(origins) * radius
 
         # Create SO(3) rotation matrices. Look at (0, 0, 0)+jitter from each ``origin[i]``.
         # From the paper: Add noise to target point.
@@ -182,8 +183,8 @@ class RegNerfModel(Model):
             origins=origins,
             directions=pose_ray_dirs,
             pixel_area=pixel_area,
-            nears=torch.full_like(origins[..., :1], self.config.near_plane, requires_grad=True),
-            fars=torch.full_like(origins[..., :1], self.config.far_plane, requires_grad=True),
+            nears=torch.full_like(origins[..., :1], self.config.collider_params["near_plane"], requires_grad=True),
+            fars=torch.full_like(origins[..., :1], self.config.collider_params["far_plane"], requires_grad=True),
         ).to("cuda")
         return rays
 
@@ -198,6 +199,42 @@ class RegNerfModel(Model):
         v01 = depth[:, :-1, 1:]
         v10 = depth[:, 1:, :-1]
         return F.mse_loss(v00, v01) + F.mse_loss(v00, v10)
+
+    def forward_random_poses(self, rays: RayBundle, k: int) -> Tuple[Dict[str, torch.Tensor], RayBundle, List[int]]:
+        """
+        Chooses random poses, and pass them forward through the model.
+
+        Why is there a separate function for this? Because there is a lot of messy code
+        dealing with tensor shapes. This function is a wrapper that takes care of that.
+
+        Args:
+            rays: self.random_rays
+            k: Number of random poses to choose
+
+        Return:
+            (outputs, rays, indices)
+            outputs: Dict of model outputs. Same type as self.get_outputs, except reshaped.
+            rays: Random indices of original rays. Flattened.
+            indices: Indices of random poses. Shape (k,)
+        """
+        # Choose indices
+        indices = random.choices(range(self.config.randpose_count), k=k)
+
+        # From shape (pose, s_patch, s_patch, 3) to (flat, 3). Required by Nerfstudio.
+        rays = RayBundle(
+            origins=rays.origins[indices].view(-1, 3),
+            directions=rays.directions[indices].view(-1, 3),
+            pixel_area=rays.pixel_area[indices].view(-1, 1),
+            nears=rays.nears[indices].view(-1, 1),
+            fars=rays.fars[indices].view(-1, 1),
+        )
+
+        outputs = self.get_outputs(rays)
+        # Reshape everything from flat to (pose, s_patch, s_patch, ...)
+        for key in outputs:
+            outputs[key] = outputs[key].view(k, self.config.randpose_s_patch, self.config.randpose_s_patch, *outputs[key].shape[1:])
+
+        return outputs, rays, indices
 
     def populate_modules(self):
         """Set the fields and modules"""
@@ -291,22 +328,10 @@ class RegNerfModel(Model):
         rgb_loss_fine = self.rgb_loss(image, outputs["rgb_fine"])
 
         # Depth smoothness loss.
-        # Choose a random batch of poses.
-        patches = random.choices(range(self.config.randpose_count), k=self.config.randpose_bs)
-        # Forward pass
-        rays = RayBundle(
-            origins=self.random_rays.origins[patches].view(-1, 3),
-            directions=self.random_rays.directions[patches].view(-1, 3),
-            pixel_area=self.random_rays.pixel_area[patches].view(-1, 1),
-            nears=self.random_rays.nears[patches].view(-1, 1),
-            fars=self.random_rays.fars[patches].view(-1, 1),
-        )
-        patch_outputs = self.get_outputs(rays)
-        # Compute loss on coarse and fine.
+        patch_outputs, _, _ = self.forward_random_poses(self.random_rays, self.config.randpose_bs)
         depth_loss = 0
-        for depth in (patch_outputs["depth_coarse"], patch_outputs["depth_fine"]):
-            depth = depth.view(len(patches), self.config.randpose_s_patch, self.config.randpose_s_patch)
-            depth_loss += self.depth_smoothness_loss(depth)
+        depth_loss += self.depth_smoothness_loss(patch_outputs["depth_coarse"])
+        depth_loss += self.depth_smoothness_loss(patch_outputs["depth_fine"])
         depth_loss /= 2
 
         loss_dict = {
@@ -357,6 +382,35 @@ class RegNerfModel(Model):
         fine_ssim = self.ssim(image, rgb_fine)
         fine_lpips = self.lpips(image, rgb_fine)
 
+
+        # Render examples of depth smoothness maps.
+        bs = 3
+        outputs, rays, indices = self.forward_random_poses(self.random_rays, bs)
+        near = self.config.collider_params["near_plane"]
+        far = self.config.collider_params["far_plane"]
+        depth_sm_coarse = colormaps.apply_depth_colormap(
+            outputs["depth_coarse"],
+            accumulation=outputs["accumulation_coarse"],
+            near_plane=near,
+            far_plane=far,
+        )
+        depth_sm_fine = colormaps.apply_depth_colormap(
+            outputs["depth_fine"],
+            accumulation=outputs["accumulation_fine"],
+            near_plane=near,
+            far_plane=far,
+        )
+        depth_sm = torch.cat([depth_sm_coarse, depth_sm_fine], dim=0)
+        # Shape (s_patch, s_patch, rgb_channels)
+        depth_sm = depth_sm[0]
+        """
+        print("SM SHAPE", depth_sm.shape)
+        print("ACC SHAPE", combined_acc.shape)
+        print("RGB shape", rgb_coarse.shape)
+        print("depth shape", depth_coarse.shape)
+        stop
+        """
+
         assert isinstance(fine_ssim, torch.Tensor)
         metrics_dict = {
             "psnr": float(fine_psnr.item()),
@@ -365,7 +419,12 @@ class RegNerfModel(Model):
             "fine_ssim": float(fine_ssim.item()),
             "fine_lpips": float(fine_lpips.item()),
         }
-        images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
+        images_dict = {
+            "img": combined_rgb,
+            "accumulation": combined_acc,
+            "depth": combined_depth,
+            "depth_smoothness": depth_sm,
+        }
         return metrics_dict, images_dict
 
 
