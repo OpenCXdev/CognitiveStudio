@@ -51,10 +51,10 @@ class RegNerfModelConfig(VanillaModelConfig):
     """RegNerf config"""
 
     loss_coefficients: Dict[str, float] = to_immutable_dict({
-        "rgb_loss_coarse": 1.0,
-        "rgb_loss_fine": 1.0,
-        "depth_smoothness": 1.0,
-        "color_likelihood": 1.0,
+        "rgb_loss_coarse": 1,
+        "rgb_loss_fine": 1,
+        "depth_smoothness": 1,
+        "color_likelihood": 1,
     })
     """Overrides corresponding param from ModelConfig."""
 
@@ -65,17 +65,15 @@ class RegNerfModelConfig(VanillaModelConfig):
 
     randpose_count: int = 10000
     """Number of random poses to generate for regularization."""
-    randpose_radius: float = 4.03112885717555
-    """Random poses are sampled from a sphere of this radius.
-    TODO: The Jax implementation uses this particular value. Is there a reason for this?
-    """
+    randpose_radius: float = 3
+    """Random poses are sampled from a sphere of this radius."""
     randpose_only_up: bool = False
     """Whether to only sample random poses from upper hemisphere."""
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 2
+    randpose_focal: float = 16
     """Random pose patch focal length."""
-    randpose_bs: int = 4
+    randpose_bs: int = 8
     """Batch size (number of poses) per step for regularization."""
 
 
@@ -112,14 +110,16 @@ class RegNerfModel(Model):
             return x / (torch.norm(x, dim=-1, keepdim=True) + eps)
 
         # Sample from top hemisphere.
-        origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32)
+        origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32, requires_grad=True)
         if self.config.randpose_only_up:
             origins[:, 2] = torch.abs(origins[:, 2])
         origins = normalize(origins) * self.config.randpose_radius
 
         # Create SO(3) rotation matrices. Look at (0, 0, 0)+jitter from each ``origin[i]``.
-        target = torch.tensor([[0, 0, 0]], dtype=torch.float32) + 0.125 * torch.randn((1, 3), dtype=torch.float32)
-        up = torch.tensor([[0, 0, 1]], dtype=torch.float32)
+        # From the paper: Add noise to target point.
+        noise = 0.125 * torch.randn((1, 3), dtype=torch.float32, requires_grad=True)
+        target = torch.tensor([[0, 0, 0]], dtype=torch.float32, requires_grad=True) + noise
+        up = torch.tensor([[0, 0, 1]], dtype=torch.float32, requires_grad=True)
         forward = normalize(target - origins)
         side = normalize(torch.cross(forward, up))
         up = normalize(torch.cross(side, forward))
@@ -148,14 +148,14 @@ class RegNerfModel(Model):
         focal = self.config.randpose_focal
 
         x, y = torch.meshgrid(
-            torch.linspace(-1, 1, s_patch),
-            torch.linspace(-1, 1, s_patch),
+            torch.linspace(-1, 1, s_patch, requires_grad=True),
+            torch.linspace(-1, 1, s_patch, requires_grad=True),
             indexing="xy",
         )
         # Shape (s_patch, s_patch, 3)
         # Camera faces in -Z direction. We will rotate these rays in the next step.
         # ray_dirs[i, j] gives ray direction for pixel (i, j) for the -Z camera.
-        ray_dirs = torch.stack([x, y, -focal * torch.ones_like(x)], dim=-1)
+        ray_dirs = torch.stack([x, y, -focal * torch.ones_like(x, requires_grad=True)], dim=-1)
         ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=-1, keepdim=True)
         # Now for each pose, apply the pose's rotation to ray_dirs
         # This creates a unique set of rays for each pose.
@@ -167,26 +167,23 @@ class RegNerfModel(Model):
         origins[:] = poses[:, None, None, :, 3]
 
         # Compute pixel area
-        # RMS of distance between pose_ray_dirs[i, j] and pose_ray_dirs[i, j+1]
-        dx = torch.sqrt(torch.sum(
+        # Squared distance between pose_ray_dirs[i, j] and pose_ray_dirs[i, j+1]
+        # Shape (randpose_count, s_patch-1, s_patch)
+        dx = torch.sum(
             (pose_ray_dirs[:, :-1] - pose_ray_dirs[:, 1:]) ** 2,
             dim=-1,
-        ))
+        )
         # Convert dim 1 back to original shape. In the previous step it was reduced by 1.
         dx = torch.cat([dx, dx[:, -2:-1]], dim=1)
-        # This particular scaling comes from the paper.
-        pixel_area = dx[..., None] * 2 / sqrt(12)
+        pixel_area = dx[..., None]
 
         # Create RayBundle
-        #origins = origins.reshape(origins.size(0), -1, 3)
-        #pose_ray_dirs = pose_ray_dirs.reshape(pose_ray_dirs.size(0), -1, 3)
-        #pixel_area = pixel_area.reshape(pixel_area.size(0), -1, 1)
         rays = RayBundle(
             origins=origins,
             directions=pose_ray_dirs,
             pixel_area=pixel_area,
-            nears=torch.ones_like(origins[..., :1]) * self.config.near_plane,
-            fars=torch.ones_like(origins[..., :1]) * self.config.far_plane,
+            nears=torch.full_like(origins[..., :1], self.config.near_plane, requires_grad=True),
+            fars=torch.full_like(origins[..., :1], self.config.far_plane, requires_grad=True),
         ).to("cuda")
         return rays
 
