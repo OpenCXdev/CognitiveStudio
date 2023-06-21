@@ -68,6 +68,7 @@ from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.pipelines.dynamic_batch import DynamicBatchPipelineConfig
+from nerfstudio.pipelines.regnerf_pipeline import RegNerfPipeline, RegNerfPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
 
 method_configs: Dict[str, TrainerConfig] = {}
@@ -601,7 +602,7 @@ method_configs["neus-facto"] = TrainerConfig(
 
 method_configs["regnerf"] = TrainerConfig(
     method_name="regnerf",
-    pipeline=VanillaPipelineConfig(
+    pipeline=RegNerfPipelineConfig(
         datamanager=VanillaDataManagerConfig(dataparser=NerfstudioDataParserConfig(), train_num_rays_per_batch=1024),
         model=RegNerfModelConfig(
             _target=RegNerfModel,

@@ -14,6 +14,7 @@
 
 """
 Implementation of RegNeRF.
+Author: Patrick Huang
 """
 from __future__ import annotations
 
@@ -60,17 +61,15 @@ class RegNerfModelConfig(VanillaModelConfig):
 
     randpose_count: int = 10000
     """Number of random poses to generate for regularization."""
-    randpose_rad_min: float = 3
-    """Min radius of random poses."""
-    randpose_rad_max: float = 10
-    """Max radius of random poses."""
+    randpose_radius: float = 4.03
+    """Radius (distance to origin) of random poses."""
     randpose_only_up: bool = False
     """Whether to only sample random poses from upper hemisphere."""
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    randpose_focal: float = 8
-    """Random pose patch focal length."""
-    randpose_bs: int = 16
+    #randpose_focal: float = 1000
+    #"""Random pose patch focal length."""
+    randpose_bs: int = 32
     """Batch size (number of poses) per step for regularization."""
 
 
@@ -83,11 +82,10 @@ class RegNerfModel(Model):
 
     config: RegNerfModelConfig
 
-    def __init__(
-        self,
-        config: RegNerfModelConfig,
-        **kwargs,
-    ) -> None:
+    def __init__(self, config: RegNerfModelConfig, **kwargs) -> None:
+        self.focal = kwargs["focal"][0][0].item()
+        """Focal length of dataparser."""
+
         self.field = None
         assert config.collider_params is not None, "RegNeRF requires bounding box collider parameters."
         super().__init__(config=config, **kwargs)
@@ -101,26 +99,20 @@ class RegNerfModel(Model):
             ret[i] gives SE(3) pose of camera i.
         """
         def normalize(x, eps=1e-8):
-            """
-            Normalizes ``x`` on last dimension.
-            """
+            """Normalizes ``x`` on last dimension."""
             return x / (torch.norm(x, dim=-1, keepdim=True) + eps)
 
         # Sample from top hemisphere.
-        origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32, requires_grad=True)
+        origins = torch.randn((self.config.randpose_count, 3), dtype=torch.float32)
         if self.config.randpose_only_up:
             origins[:, 2] = torch.abs(origins[:, 2])
-        rad_min = self.config.randpose_rad_min
-        rad_max = self.config.randpose_rad_max
-        radius = torch.rand((self.config.randpose_count, 1), dtype=torch.float32, requires_grad=True)
-        radius = rad_min + (rad_max - rad_min) * radius
-        origins = normalize(origins) * radius
+        origins = normalize(origins) * self.config.randpose_radius
 
         # Create SO(3) rotation matrices. Look at (0, 0, 0)+jitter from each ``origin[i]``.
         # From the paper: Add noise to target point.
-        noise = 0.125 * torch.randn((1, 3), dtype=torch.float32, requires_grad=True)
-        target = torch.tensor([[0, 0, 0]], dtype=torch.float32, requires_grad=True) + noise
-        up = torch.tensor([[0, 0, 1]], dtype=torch.float32, requires_grad=True)
+        noise = 0.125 * torch.randn((1, 3), dtype=torch.float32)
+        target = torch.tensor([[0, 0, 0]], dtype=torch.float32) + noise
+        up = torch.tensor([[0, 0, 1]], dtype=torch.float32)
         forward = normalize(target - origins)
         side = normalize(torch.cross(forward, up))
         up = normalize(torch.cross(side, forward))
@@ -128,7 +120,7 @@ class RegNerfModel(Model):
         rotations = torch.stack([side, up, forward], dim=-1)
 
         # Combine ``origins`` and ``rotations`` to SE(3) poses.
-        # We use a 3x4 matrix because the last row doesn't matter.
+        # We use a 3x4 matrix (instead of 4x4) because the last row doesn't matter.
         poses = torch.cat([rotations, origins.unsqueeze(-1)], dim=-1)
 
         return poses
@@ -146,32 +138,32 @@ class RegNerfModel(Model):
             Same for origins
         """
         s_patch = self.config.randpose_s_patch
-        focal = self.config.randpose_focal
+        focal = self.focal
 
         x, y = torch.meshgrid(
-            torch.linspace(-1, 1, s_patch, requires_grad=True),
-            torch.linspace(-1, 1, s_patch, requires_grad=True),
+            torch.linspace(-1, 1, s_patch),
+            torch.linspace(-1, 1, s_patch),
             indexing="xy",
         )
         # Shape (s_patch, s_patch, 3)
         # Camera faces in -Z direction. We will rotate these rays in the next step.
         # ray_dirs[i, j] gives ray direction for pixel (i, j) for the -Z camera.
-        ray_dirs = torch.stack([x, y, -focal * torch.ones_like(x, requires_grad=True)], dim=-1)
+        ray_dirs = torch.stack([x, y, -focal * torch.ones_like(x)], dim=-1)
         ray_dirs = ray_dirs / torch.norm(ray_dirs, dim=-1, keepdim=True)
         # Now for each pose, apply the pose's rotation to ray_dirs
         # This creates a unique set of rays for each pose.
         # Shape (randpose_count, s_patch, s_patch, 3)
         # This line is matrix mult on last two dims; the operator @ doesn't work.
-        pose_ray_dirs = torch.sum(poses[:, None, None, :, :3] * ray_dirs[None, ..., None, :], dim=-1)
+        directions = torch.sum(poses[:, None, None, :, :3] * ray_dirs[None, ..., None, :], dim=-1)
         # origins is same shape as pose_ray_dirs.
-        origins = torch.empty_like(pose_ray_dirs)
+        origins = torch.empty_like(directions)
         origins[:] = poses[:, None, None, :, 3]
 
         # Compute pixel area
         # Squared distance between pose_ray_dirs[i, j] and pose_ray_dirs[i, j+1]
         # Shape (randpose_count, s_patch-1, s_patch)
         dx = torch.sum(
-            (pose_ray_dirs[:, :-1] - pose_ray_dirs[:, 1:]) ** 2,
+            (directions[:, :-1] - directions[:, 1:]) ** 2,
             dim=-1,
         )
         # Convert dim 1 back to original shape. In the previous step it was reduced by 1.
@@ -179,12 +171,14 @@ class RegNerfModel(Model):
         pixel_area = dx[..., None]
 
         # Create RayBundle
+        #origins.requires_grad = True
+        #directions.requires_grad = True
         rays = RayBundle(
             origins=origins,
-            directions=pose_ray_dirs,
+            directions=directions,
             pixel_area=pixel_area,
-            nears=torch.full_like(origins[..., :1], self.config.collider_params["near_plane"], requires_grad=True),
-            fars=torch.full_like(origins[..., :1], self.config.collider_params["far_plane"], requires_grad=True),
+            nears=torch.full_like(origins[..., :1], self.config.collider_params["near_plane"]),
+            fars=torch.full_like(origins[..., :1], self.config.collider_params["far_plane"]),
         ).to("cuda")
         return rays
 
@@ -335,8 +329,8 @@ class RegNerfModel(Model):
         depth_loss /= 2
 
         loss_dict = {
-            "rgb_loss_coarse": rgb_loss_coarse,
-            "rgb_loss_fine": rgb_loss_fine,
+                #"rgb_loss_coarse": rgb_loss_coarse,
+                #"rgb_loss_fine": rgb_loss_fine,
             "depth_smoothness": depth_loss,
         }
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
@@ -403,13 +397,6 @@ class RegNerfModel(Model):
         depth_sm = torch.cat([depth_sm_coarse, depth_sm_fine], dim=0)
         # Shape (s_patch, s_patch, rgb_channels)
         depth_sm = depth_sm[0]
-        """
-        print("SM SHAPE", depth_sm.shape)
-        print("ACC SHAPE", combined_acc.shape)
-        print("RGB shape", rgb_coarse.shape)
-        print("depth shape", depth_coarse.shape)
-        stop
-        """
 
         assert isinstance(fine_ssim, torch.Tensor)
         metrics_dict = {
