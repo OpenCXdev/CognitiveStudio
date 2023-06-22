@@ -30,6 +30,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
+from nerfstudio.data.datamanagers.regnerf_datamanager import RegNerfDataManagerConfig
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 from nerfstudio.data.dataparsers.dnerf_dataparser import DNeRFDataParserConfig
 from nerfstudio.data.dataparsers.dycheck_dataparser import DycheckDataParserConfig
@@ -603,7 +604,7 @@ method_configs["neus-facto"] = TrainerConfig(
 method_configs["regnerf"] = TrainerConfig(
     method_name="regnerf",
     pipeline=RegNerfPipelineConfig(
-        datamanager=VanillaDataManagerConfig(dataparser=NerfstudioDataParserConfig(), train_num_rays_per_batch=1024),
+        datamanager=RegNerfDataManagerConfig(dataparser=NerfstudioDataParserConfig(), train_num_rays_per_batch=1024),
         model=RegNerfModelConfig(
             _target=RegNerfModel,
             loss_coefficients={

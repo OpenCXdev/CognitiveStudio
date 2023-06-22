@@ -171,8 +171,8 @@ class RegNerfModel(Model):
         pixel_area = dx[..., None]
 
         # Create RayBundle
-        #origins.requires_grad = True
-        #directions.requires_grad = True
+        origins.requires_grad = True
+        directions.requires_grad = True
         rays = RayBundle(
             origins=origins,
             directions=directions,
@@ -192,7 +192,8 @@ class RegNerfModel(Model):
         v00 = depth[:, :-1, :-1]
         v01 = depth[:, :-1, 1:]
         v10 = depth[:, 1:, :-1]
-        return F.mse_loss(v00, v01) + F.mse_loss(v00, v10)
+        loss = F.mse_loss(v00, v01) + F.mse_loss(v00, v10)
+        return loss
 
     def forward_random_poses(self, rays: RayBundle, k: int) -> Tuple[Dict[str, torch.Tensor], RayBundle, List[int]]:
         """
@@ -258,7 +259,7 @@ class RegNerfModel(Model):
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer()
+        self.renderer_depth = DepthRenderer(method="expected")
 
         # losses
         self.rgb_loss = MSELoss()
@@ -329,8 +330,8 @@ class RegNerfModel(Model):
         depth_loss /= 2
 
         loss_dict = {
-                #"rgb_loss_coarse": rgb_loss_coarse,
-                #"rgb_loss_fine": rgb_loss_fine,
+            "rgb_loss_coarse": rgb_loss_coarse,
+            "rgb_loss_fine": rgb_loss_fine,
             "depth_smoothness": depth_loss,
         }
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)

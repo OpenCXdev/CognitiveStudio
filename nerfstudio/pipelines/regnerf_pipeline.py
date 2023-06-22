@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Type
 
+from nerfstudio.data.datamanagers.regnerf_datamanager import RegNerfDataManagerConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 
 
@@ -29,6 +30,8 @@ class RegNerfPipelineConfig(VanillaPipelineConfig):
     """Config for RegNerf pipeline."""
 
     _target: Type = field(default_factory=lambda: RegNerfPipeline)
+    """Overrides superclass."""
+    datamanager: RegNerfDataManagerConfig = RegNerfDataManagerConfig()
     """Overrides superclass."""
 
 
