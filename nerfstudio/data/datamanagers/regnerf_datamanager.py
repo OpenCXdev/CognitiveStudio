@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Generic, Tuple, Type
 
+import torch
+
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig, TDataset
 
@@ -43,21 +45,4 @@ class RegNerfDataManager(VanillaDataManager, Generic[TDataset]):
     - Performs sample space annealing.
     """
 
-    def next_train(self, step: int) -> Tuple[RayBundle, Dict]:
-        """
-        Returns the next batch of data from the train dataloader.
-        Also does sample space annealing by changing RayBundle nears and fars.
-        """
-        # This is copied from super class.
-        self.train_count += 1
-        image_batch = next(self.iter_train_image_dataloader)
-        assert self.train_pixel_sampler is not None
-        assert isinstance(image_batch, dict)
-        batch = self.train_pixel_sampler.sample(image_batch)
-        ray_indices = batch["indices"]
-        ray_bundle = self.train_ray_generator(ray_indices)
-
-        # Sample space annealing.
-        # TODO
-
-        return ray_bundle, batch
+    config: RegNerfDataManagerConfig

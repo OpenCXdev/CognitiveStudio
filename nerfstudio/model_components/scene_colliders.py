@@ -18,8 +18,8 @@ Scene Colliders
 
 from __future__ import annotations
 
+import numpy as np
 import torch
-from jaxtyping import Float
 from torch import Tensor, nn
 
 from nerfstudio.cameras.rays import RayBundle
@@ -187,3 +187,64 @@ class NearFarCollider(SceneCollider):
         ray_bundle.nears = ones * near_plane
         ray_bundle.fars = ones * self.far_plane
         return ray_bundle
+
+
+class AnnealedNearFarCollider(NearFarCollider):
+    """
+    Near far collider with annealing.
+    Used for RegNerf.
+
+    Args:
+        anneal_midfac: mid = lerp(near, far, anneal_midfac)
+        anneal_start: Factor of frustrum length at beginning of training.
+            Corresponds to p_s in the paper.
+        anneal_duration: Training steps until annealing is complete (full ray is used).
+            Corresponds to N_t in the paper.
+    """
+
+    def __init__(self, anneal_midfac, anneal_start, anneal_duration, **kwargs) -> None:
+        self.anneal_midfac = anneal_midfac
+        self.anneal_start = anneal_start
+        self.anneal_duration = anneal_duration
+        super().__init__(**kwargs)
+
+    def forward(self, ray_bundle: RayBundle, step: int = -1) -> RayBundle:
+        """
+        Overrides super class: Requires and passes the ``step`` argument.
+        """
+        return self.set_nears_and_fars(ray_bundle, step)
+
+    def set_nears_and_fars(self, ray_bundle: RayBundle, step: int) -> RayBundle:
+        """
+        The argument ``step`` is added, which makes the method's signature different
+        from the super class.
+        """
+        ray_bundle = super().set_nears_and_fars(ray_bundle)
+        if step >= 0:
+            self.anneal_rays(ray_bundle, step)
+        return ray_bundle
+
+    def get_anneal_fac(self, step: int) -> float:
+        """
+        Computes annealing factor.
+        """
+        anneal_fac = np.clip(step / self.anneal_duration, self.anneal_start, 1)
+        return anneal_fac
+
+    def anneal_rays(self, rays: RayBundle, step: int) -> None:
+        """
+        Does sample space annealing inplace on the given rays.
+
+        Args:
+            rays: RayBundle to anneal.
+            step: Training step.
+        """
+        assert rays.fars is not None and rays.nears is not None, \
+            "Rays must have nears and fars to anneal."
+
+        anneal_fac = self.get_anneal_fac(step)
+        mid = self.anneal_midfac * (rays.fars - rays.nears) + rays.nears
+        nears = mid + (rays.nears - mid) * anneal_fac
+        fars = mid + (rays.fars - mid) * anneal_fac
+        rays.nears = nears
+        rays.fars = fars

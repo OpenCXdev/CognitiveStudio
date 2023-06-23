@@ -19,9 +19,8 @@ Author: Patrick Huang
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
-from math import sqrt
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -35,13 +34,14 @@ from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
-from nerfstudio.model_components.losses import MSELoss, depth_loss
+from nerfstudio.model_components.losses import MSELoss
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
     DepthRenderer,
     RGBRenderer,
 )
+from nerfstudio.model_components.scene_colliders import AnnealedNearFarCollider
 from nerfstudio.models.base_model import Model
 from nerfstudio.models.vanilla_nerf import VanillaModelConfig
 from nerfstudio.utils import colormaps, colors, misc
@@ -58,6 +58,15 @@ class RegNerfModelConfig(VanillaModelConfig):
         "color_likelihood": 1,
     })
     """Overrides corresponding param from ModelConfig."""
+
+    collider_params: Dict[str, float] = to_immutable_dict({
+        "near_plane": 2.0,
+        "far_plane": 6.0,
+        "anneal_midfac": 0.5,
+        "anneal_start": 0.5,
+        "anneal_duration": 200,
+    })
+    """This is for AnnealedNearFarCollider"""
 
     randpose_count: int = 10000
     """Number of random poses to generate for regularization."""
@@ -80,6 +89,7 @@ class RegNerfModel(Model):
         config: RegNerf configuration to instantiate model
     """
 
+    collider: AnnealedNearFarCollider
     config: RegNerfModelConfig
 
     def __init__(self, config: RegNerfModelConfig, **kwargs) -> None:
@@ -177,8 +187,6 @@ class RegNerfModel(Model):
             origins=origins,
             directions=directions,
             pixel_area=pixel_area,
-            nears=torch.full_like(origins[..., :1], self.config.collider_params["near_plane"]),
-            fars=torch.full_like(origins[..., :1], self.config.collider_params["far_plane"]),
         ).to("cuda")
         return rays
 
@@ -195,9 +203,10 @@ class RegNerfModel(Model):
         loss = F.mse_loss(v00, v01) + F.mse_loss(v00, v10)
         return loss
 
-    def forward_random_poses(self, rays: RayBundle, k: int) -> Tuple[Dict[str, torch.Tensor], RayBundle, List[int]]:
+    def forward_random_poses(self, rays: RayBundle, k: int, step: int = -1) -> Tuple[Dict[str, torch.Tensor], RayBundle, List[int]]:
         """
         Chooses random poses, and pass them forward through the model.
+        Does annealing on their rays.
 
         Why is there a separate function for this? Because there is a lot of messy code
         dealing with tensor shapes. This function is a wrapper that takes care of that.
@@ -205,6 +214,7 @@ class RegNerfModel(Model):
         Args:
             rays: self.random_rays
             k: Number of random poses to choose
+            step: Current training step
 
         Return:
             (outputs, rays, indices)
@@ -220,9 +230,8 @@ class RegNerfModel(Model):
             origins=rays.origins[indices].view(-1, 3),
             directions=rays.directions[indices].view(-1, 3),
             pixel_area=rays.pixel_area[indices].view(-1, 1),
-            nears=rays.nears[indices].view(-1, 1),
-            fars=rays.fars[indices].view(-1, 1),
         )
+        rays = self.collider(rays, step)
 
         outputs = self.get_outputs(rays)
         # Reshape everything from flat to (pose, s_patch, s_patch, ...)
@@ -234,6 +243,9 @@ class RegNerfModel(Model):
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
+
+        # Override collider
+        self.collider = AnnealedNearFarCollider(**self.config.collider_params)
 
         # Set up random poses.
         self.random_poses = self.generate_random_poses()
@@ -316,14 +328,18 @@ class RegNerfModel(Model):
         }
         return outputs
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None):
+    def get_loss_dict(self, outputs, batch, metrics_dict=None, step: int = -1):
+        """
+        Args:
+            step: Current training step.
+        """
         # RGB loss between render and ground truth.
         image = batch["image"].to(self.device)
         rgb_loss_coarse = self.rgb_loss(image, outputs["rgb_coarse"])
         rgb_loss_fine = self.rgb_loss(image, outputs["rgb_fine"])
 
         # Depth smoothness loss.
-        patch_outputs, _, _ = self.forward_random_poses(self.random_rays, self.config.randpose_bs)
+        patch_outputs, _, _ = self.forward_random_poses(self.random_rays, self.config.randpose_bs, step)
         depth_loss = 0
         depth_loss += self.depth_smoothness_loss(patch_outputs["depth_coarse"])
         depth_loss += self.depth_smoothness_loss(patch_outputs["depth_fine"])
@@ -377,7 +393,6 @@ class RegNerfModel(Model):
         fine_ssim = self.ssim(image, rgb_fine)
         fine_lpips = self.lpips(image, rgb_fine)
 
-
         # Render examples of depth smoothness maps.
         bs = 3
         outputs, rays, indices = self.forward_random_poses(self.random_rays, bs)
@@ -414,6 +429,14 @@ class RegNerfModel(Model):
             "depth_smoothness": depth_sm,
         }
         return metrics_dict, images_dict
+
+    def forward(self, ray_bundle: RayBundle, step: int = -1) -> Dict[str, Union[torch.Tensor, List]]:
+        """
+        Overrides super class: Requires and passes the ``step`` argument.
+        """
+        if self.collider is not None:
+            ray_bundle = self.collider(ray_bundle, step)
+        return self.get_outputs(ray_bundle)
 
 
 def plot_patch_rays(patch_rays: RayBundle):
