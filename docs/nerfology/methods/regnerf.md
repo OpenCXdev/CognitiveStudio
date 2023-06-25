@@ -47,7 +47,18 @@ To create a loss function, these steps are followed:
 
 ### Color Likelihood
 
-TODO
+This aims to improve RGB color accuracy from unobserved viewpoints with a
+measure of how likely a set of colors is to appear. Using the same patches as
+above (Depth Smoothness Loss), the RGB image rendered from those viewpoints are
+compared to "diverse natural images", incentivizing higher probability patches
+(through the loss function).
+
+A separate RealNVP model is trained on the "diverse natural images", learning
+the likelihood of any 8x8 patch of pixels appearing. Renders from the patch
+viewpoints are passed through, and a negative log likelihood loss is applied.
+
+In both the official and this (CognitiveStudio) implementation, Color Likelihood
+loss is omitted.
 
 ### Sample Space Annealing
 

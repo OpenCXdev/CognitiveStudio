@@ -76,9 +76,7 @@ class RegNerfModelConfig(VanillaModelConfig):
     """Whether to only sample random poses from upper hemisphere."""
     randpose_s_patch: int = 8
     """Random pose patch size."""
-    #randpose_focal: float = 1000
-    #"""Random pose patch focal length."""
-    randpose_bs: int = 32
+    randpose_bs: int = 16
     """Batch size (number of poses) per step for regularization."""
 
 
@@ -151,8 +149,8 @@ class RegNerfModel(Model):
         focal = self.focal
 
         x, y = torch.meshgrid(
-            torch.linspace(-1, 1, s_patch),
-            torch.linspace(-1, 1, s_patch),
+            torch.linspace(-1, 1, s_patch) * s_patch,
+            torch.linspace(-1, 1, s_patch) * s_patch,
             indexing="xy",
         )
         # Shape (s_patch, s_patch, 3)
