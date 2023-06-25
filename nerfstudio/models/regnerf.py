@@ -36,11 +36,8 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import MSELoss
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
-from nerfstudio.model_components.renderers import (
-    AccumulationRenderer,
-    DepthRenderer,
-    RGBRenderer,
-)
+from nerfstudio.model_components.renderers import (AccumulationRenderer,
+                                                   DepthRenderer, RGBRenderer)
 from nerfstudio.model_components.scene_colliders import AnnealedNearFarCollider
 from nerfstudio.models.base_model import Model
 from nerfstudio.models.vanilla_nerf import VanillaModelConfig
@@ -64,7 +61,7 @@ class RegNerfModelConfig(VanillaModelConfig):
         "far_plane": 6.0,
         "anneal_midfac": 0.5,
         "anneal_start": 0.5,
-        "anneal_duration": 200,
+        "anneal_duration": 2000,
     })
     """This is for AnnealedNearFarCollider"""
 
@@ -441,8 +438,8 @@ def plot_patch_rays(patch_rays: RayBundle):
     """
     3D matplotlib of a few patches.
     """
-    import numpy as np
     import matplotlib.pyplot as plt
+    import numpy as np
     from mpl_toolkits.mplot3d import art3d
 
     fig = plt.figure()
