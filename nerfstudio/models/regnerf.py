@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +39,7 @@ from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.model_components.renderers import (AccumulationRenderer,
                                                    DepthRenderer, RGBRenderer)
 from nerfstudio.model_components.scene_colliders import AnnealedNearFarCollider
-from nerfstudio.models.base_model import Model
+from nerfstudio.models.mipnerf import MipNerfModel
 from nerfstudio.models.vanilla_nerf import VanillaModelConfig
 from nerfstudio.utils import colormaps, colors, misc
 
@@ -77,11 +77,15 @@ class RegNerfModelConfig(VanillaModelConfig):
     """Batch size (number of poses) per step for regularization."""
 
 
-class RegNerfModel(Model):
-    """RegNeRF model
+class RegNerfModel(MipNerfModel):
+    """
+    RegNeRF model.
 
-    Args:
-        config: RegNerf configuration to instantiate model
+    Implements:
+    - Geometry smoothness regularization.
+    - Sample space annealing.
+
+    Color likelihood loss was omitted.
     """
 
     collider: AnnealedNearFarCollider
@@ -91,10 +95,7 @@ class RegNerfModel(Model):
         self.focal = kwargs["focal"][0][0].item()
         """Focal length of dataparser."""
 
-        self.field = None
-        assert config.collider_params is not None, "RegNeRF requires bounding box collider parameters."
         super().__init__(config=config, **kwargs)
-        assert self.config.collider_params is not None, "RegNeRF requires collider parameters to be set."
 
     def generate_random_poses(self) -> torch.Tensor:
         """
@@ -236,92 +237,23 @@ class RegNerfModel(Model):
         return outputs, rays, indices
 
     def populate_modules(self):
-        """Set the fields and modules"""
+        """
+        - Overrides collider.
+        - Overrides depth renderer.
+        - Generates random poses.
+        """
         super().populate_modules()
 
         # Override collider
         self.collider = AnnealedNearFarCollider(**self.config.collider_params)
 
-        # Set up random poses.
+        # The "expected" method is needed to pass grad from model to depth smoothness loss.
+        self.renderer_depth = DepthRenderer(method="expected")
+
+        # Generate random poses.
         self.random_poses = self.generate_random_poses()
         self.random_rays = self.generate_patch_rays(self.random_poses)
         #plot_patch_rays(self.random_rays)
-
-        # setting up fields
-        position_encoding = NeRFEncoding(
-            in_dim=3, num_frequencies=16, min_freq_exp=0.0, max_freq_exp=16.0, include_input=True
-        )
-        direction_encoding = NeRFEncoding(
-            in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=4.0, include_input=True
-        )
-
-        self.field = NeRFField(
-            position_encoding=position_encoding, direction_encoding=direction_encoding, use_integrated_encoding=True
-        )
-
-        # samplers
-        self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
-        self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples, include_original=False)
-
-        # renderers
-        self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
-        self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer(method="expected")
-
-        # losses
-        self.rgb_loss = MSELoss()
-
-        # metrics
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
-        self.ssim = structural_similarity_index_measure
-        self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
-
-    def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        param_groups = {}
-        if self.field is None:
-            raise ValueError("populate_fields() must be called before get_param_groups")
-        param_groups["fields"] = list(self.field.parameters())
-        return param_groups
-
-    def get_outputs(self, ray_bundle: RayBundle):
-        if self.field is None:
-            raise ValueError("populate_fields() must be called before get_outputs")
-
-        # uniform sampling
-        ray_samples_uniform = self.sampler_uniform(ray_bundle)
-
-        # First pass: coarse network
-        field_outputs_coarse = self.field.forward(ray_samples_uniform)
-        weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
-        rgb_coarse = self.renderer_rgb(
-            rgb=field_outputs_coarse[FieldHeadNames.RGB],
-            weights=weights_coarse,
-        )
-        accumulation_coarse = self.renderer_accumulation(weights_coarse)
-        depth_coarse = self.renderer_depth(weights_coarse, ray_samples_uniform)
-
-        # pdf sampling
-        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse)
-
-        # Second pass: fine network
-        field_outputs_fine = self.field.forward(ray_samples_pdf)
-        weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
-        rgb_fine = self.renderer_rgb(
-            rgb=field_outputs_fine[FieldHeadNames.RGB],
-            weights=weights_fine,
-        )
-        accumulation_fine = self.renderer_accumulation(weights_fine)
-        depth_fine = self.renderer_depth(weights_fine, ray_samples_pdf)
-
-        outputs = {
-            "rgb_coarse": rgb_coarse,
-            "rgb_fine": rgb_fine,
-            "accumulation_coarse": accumulation_coarse,
-            "accumulation_fine": accumulation_fine,
-            "depth_coarse": depth_coarse,
-            "depth_fine": depth_fine,
-        }
-        return outputs
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None, step: int = -1):
         """
@@ -349,44 +281,11 @@ class RegNerfModel(Model):
         return loss_dict
 
     def get_image_metrics_and_images(
-        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
-    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        assert self.config.collider_params is not None, "RegNeRF requires collider parameters to be set."
-        image = batch["image"].to(outputs["rgb_coarse"].device)
-        rgb_coarse = outputs["rgb_coarse"]
-        rgb_fine = outputs["rgb_fine"]
-        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
-        acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
-
-        assert self.config.collider_params is not None
-        depth_coarse = colormaps.apply_depth_colormap(
-            outputs["depth_coarse"],
-            accumulation=outputs["accumulation_coarse"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
-        )
-        depth_fine = colormaps.apply_depth_colormap(
-            outputs["depth_fine"],
-            accumulation=outputs["accumulation_fine"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
-        )
-
-        combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)
-        combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
-        combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
-
-        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb_coarse = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
-        rgb_fine = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
-        rgb_coarse = torch.clip(rgb_coarse, min=0, max=1)
-        rgb_fine = torch.clip(rgb_fine, min=0, max=1)
-
-        coarse_psnr = self.psnr(image, rgb_coarse)
-        fine_psnr = self.psnr(image, rgb_fine)
-        fine_ssim = self.ssim(image, rgb_fine)
-        fine_lpips = self.lpips(image, rgb_fine)
+            self,
+            outputs: Dict[str, torch.Tensor],
+            batch: Dict[str, torch.Tensor],
+            ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
 
         # Render examples of depth smoothness maps.
         bs = 3
@@ -409,20 +308,7 @@ class RegNerfModel(Model):
         # Shape (s_patch, s_patch, rgb_channels)
         depth_sm = depth_sm[0]
 
-        assert isinstance(fine_ssim, torch.Tensor)
-        metrics_dict = {
-            "psnr": float(fine_psnr.item()),
-            "coarse_psnr": float(coarse_psnr.item()),
-            "fine_psnr": float(fine_psnr.item()),
-            "fine_ssim": float(fine_ssim.item()),
-            "fine_lpips": float(fine_lpips.item()),
-        }
-        images_dict = {
-            "img": combined_rgb,
-            "accumulation": combined_acc,
-            "depth": combined_depth,
-            "depth_smoothness": depth_sm,
-        }
+        images_dict["depth_smoothness"] = depth_sm
         return metrics_dict, images_dict
 
     def forward(self, ray_bundle: RayBundle, step: int = -1) -> Dict[str, Union[torch.Tensor, List]]:
